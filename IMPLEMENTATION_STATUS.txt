@@ -1,0 +1,147 @@
+MYK Laticrete Knowledge Ingestion Engine – Implementation Status
+
+Last updated: 2026-05-22
+
+Repository root: /Users/niksmac/Desktop/scraper
+
+WHAT IS IMPLEMENTED
+
+1) Backend scaffold
+   - backend/ directory created
+   - Python virtual environment: backend/.venv (Python 3.11)
+   - Requirements pinned to avoid resolver conflicts:
+     - langgraph==0.2.76
+     - langchain==0.3.30
+     - langchain-core==0.3.86
+     - langchain-google-genai==2.1.12
+     - langchain-chroma==0.2.6
+     - langchain-neo4j==0.1.1
+     - langchain-community==0.3.31
+     - chromadb==1.5.9
+     - neo4j==5.25.0
+     - requests==2.32.5
+     - pydantic-settings==2.10.1
+     - httpx==0.28.1
+     - numpy==1.26.4
+     - plus the rest of crawler + parsing deps (see backend/requirements.txt)
+
+2) Environment files
+   - backend/.env.example created with all required keys
+   - backend/.env created (Gemini API key provided by user)
+   - Gemini API key source: https://aistudio.google.com
+
+3) Task 1 – Crawler core modules
+   Implemented modules under backend/crawler:
+   - models.py: CrawlRecord dataclass
+   - robots_handler.py: robots.txt handling with caching
+   - rate_limiter.py: token bucket + 2s delay + max 4 concurrent
+   - content_detector.py: HTML/PDF/DOCX routing
+   - extractors/
+       - html_extractor.py (BS4; strips nav/footer/scripts; extracts links)
+       - pdf_extractor.py (PyMuPDF + pdfplumber table extraction)
+       - docx_extractor.py (python-docx)
+   - storage.py: SQLite schema + record/history storage
+   - dedup.py: xxhash-based content hash + ETag check
+   - spider.py: CrawlOrchestrator (fetch, detect, extract, dedup, store)
+
+4) Task 1 – Seed URLs
+   - backend/config/seed_urls.py includes 50+ URLs from TASK1_CRAWLER.md
+
+5) LangGraph-ready crawl node
+   - backend/agents/state.py: IngestionState, RetrievalState, SyncState TypedDicts
+   - backend/agents/nodes/crawl_node.py: calls CrawlOrchestrator and stores crawl_records in state
+
+6) Storage output
+   - Crawl records stored in SQLite at: data/crawl.db (project root)
+   - Table: crawl_records (includes full text in text column)
+   - Table: crawl_history (unchanged markers for dedup)
+
+7) Task 2 – Parser core modules
+   Implemented modules under backend/parser:
+   - product_schema.py: ProductRecord, TechnicalSpecs, Packaging Pydantic models (pre-existing)
+   - llm_extractor.py: Gemini 2.5 Flash extraction via langchain-google-genai
+       - extract_product_from_record() + extract_batch()
+       - 4-second rate-limit delay between calls (free tier: 15 RPM)
+       - JSON fence stripping, partial JSON salvage on parse error
+       - dotenv auto-loading from backend/.env
+   - pdf_table_parser.py: reformats tab/space-aligned columns → markdown tables
+   - field_validator.py: compute_confidence() + field_report() (12-field scoring)
+   - version_tracker.py: SQLite product_versions table (WAL mode, diff summaries)
+   - qa_report.py: generates data/qa_report.md (confidence bands, fill rates, flagged items)
+
+8) Task 2 – LangChain Tools
+   backend/tools/parse_tools.py:
+   - extract_product_specs @tool: thin wrapper around llm_extractor
+   - validate_product_schema @tool: Pydantic validation with error reporting
+
+9) Task 2 – LangGraph parse_node
+   backend/agents/nodes/parse_node.py:
+   - Filters records < 200 chars (category pages, redirects)
+   - Calls Gemini via extract_batch (rate-limited)
+   - _sanitize_nulls: converts Gemini null lists → [] before Pydantic validation
+   - Version tracking via VersionTracker.upsert()
+   - Persists to `products` SQLite table (WAL mode)
+   - Generates QA report after batch
+
+10) State update
+    backend/agents/state.py now includes:
+    - IngestionState: full pipeline state (crawl_records, products, errors, metrics, current_phase, sync_status, graph_updates, embedding_updates)
+    - RetrievalState: ReAct agent state with add_messages annotation
+    - SyncState: webhook-triggered sync state
+
+VERIFIED
+   Live Gemini test extracted MYK LATICRETE 335 Super Flex Plus with:
+   - extraction_confidence: 1.00 (all 12/12 fields populated)
+   - All 9 technical specs extracted with units
+   - needs_human_review: False
+
+HOW TO RUN PARSE_NODE (from repo root)
+
+  backend/.venv/bin/python - <<'PY'
+  import sys; sys.path.insert(0, '.')
+  import sqlite3
+  from datetime import datetime
+  from backend.crawler.models import CrawlRecord
+  from backend.agents.nodes.parse_node import parse_node
+
+  # Load a product-page record from DB (or build one manually)
+  conn = sqlite3.connect('data/crawl.db')
+  rows = conn.execute('SELECT url, content_type, text, fetched_at FROM crawl_records LIMIT 5').fetchall()
+  conn.close()
+
+  records = [CrawlRecord(url=r[0], fetched_at=datetime.fromisoformat(r[3]),
+             status_code=200, content_type=r[1], content_hash='', text=r[2] or '') for r in rows]
+
+  state = {'urls_to_crawl': [], 'crawl_records': records,
+           'products': [], 'errors': [], 'metrics': {'crawl_count': len(records)}}
+  state = parse_node(state)
+  print(f"Parsed {len(state['products'])} products")
+  PY
+
+View parsed products:
+
+  sqlite3 data/crawl.db "SELECT product_name, product_family, confidence, needs_review, version FROM products;"
+
+View QA report:
+
+  cat data/qa_report.md
+
+WHAT IS NOT IMPLEMENTED YET
+
+- Task 3 (Graph): graph/schema.py, graph/neo4j_client.py, graph/builder.py, graph/embedder.py, graph/vector_store.py
+- Task 3 tools: tools/graph_tools.py, tools/vector_tools.py, tools/compare_tools.py
+- Task 3 node: agents/nodes/embed_node.py
+- Full agents/ingestion_graph.py (crawl→parse→embed→sync pipeline)
+- agents/retrieval_agent.py (ReAct agent)
+- agents/sync_graph.py (webhook-triggered pipeline)
+- Task 4 (Sync): sync/delta_detector.py, sync/reconciler.py, sync/scheduler.py
+- FastAPI API layer (api/)
+- Docker setup, tests
+
+NOTES
+
+- Crawler output DB used during tests is data/crawl.db at repo root.
+- If you run sqlite3 inside backend/, use ../data/crawl.db.
+- Parse node correctly skips category listing pages (no product_name found).
+  Point it at individual product detail pages for best results.
+- Gemini free tier: 15 RPM. extract_batch() enforces 4s delay between calls.
