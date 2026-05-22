@@ -76,6 +76,11 @@ async def run_all():
             print("\n🛠  No tools called (answered from context)")
         print(f"⏱  Time: {elapsed:.1f}s")
 
+        # Respect 5 RPM free-tier limit — each multi-step query uses 2-3 calls
+        if idx < total_queries:
+            print("   (waiting 15s to respect rate limit…)")
+            await asyncio.sleep(15)
+
     print(f"\n{'=' * 70}")
     print("Demo complete.")
 

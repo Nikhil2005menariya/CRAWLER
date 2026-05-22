@@ -110,20 +110,21 @@ def product_lookup_tool(name_or_sku: str) -> str:
         JSON string with full product details, or an error if not found.
     """
     graph = _graph()
+    # Normalize ® for matching
+    q = name_or_sku.replace("®", "").strip()
     if graph is None:
-        # Fallback to SQLite when Neo4j is offline
         return _sqlite_lookup(name_or_sku)
 
     cypher = """
         MATCH (p:Product)
-        WHERE toLower(p.name) CONTAINS toLower($q) OR p.sku = $q
+        WHERE toLower(replace(p.name, '®', '')) CONTAINS toLower($q) OR p.sku = $q
         RETURN p.name AS name, p.sku AS sku, p.family AS family,
                p.grade AS grade, p.description AS description,
                p.specs_json AS specs, p.confidence AS confidence
         LIMIT 1
     """
     try:
-        results = graph.query(cypher, {"q": name_or_sku})
+        results = graph.query(cypher, {"q": q})
         if results:
             r = results[0]
             if r.get("specs"):
@@ -139,11 +140,13 @@ def _sqlite_lookup(name_or_sku: str) -> str:
     """SQLite fallback lookup when Neo4j is offline."""
     import sqlite3, os
     db_path = os.environ.get("SQLITE_DB_PATH", "./data/crawl.db")
+    # Strip ® and normalize for fuzzy matching
+    q = name_or_sku.replace("®", "").replace("  ", " ").strip()
     try:
         conn = sqlite3.connect(db_path, timeout=5)
         rows = conn.execute(
-            "SELECT data_json FROM products WHERE product_name LIKE ? OR sku = ? LIMIT 1",
-            (f"%{name_or_sku}%", name_or_sku),
+            "SELECT data_json FROM products WHERE LOWER(REPLACE(product_name,'®','')) LIKE LOWER(?) OR sku = ? LIMIT 1",
+            (f"%{q}%", name_or_sku),
         ).fetchall()
         conn.close()
         if rows:
@@ -221,11 +224,12 @@ def get_specs_tool(product_name: str) -> str:
     # Also fetch packaging from SQLite for completeness
     import sqlite3, os
     db_path = os.environ.get("SQLITE_DB_PATH", "./data/crawl.db")
+    q = product_name.replace("®", "").strip()
     try:
         conn = sqlite3.connect(db_path, timeout=5)
         row = conn.execute(
-            "SELECT data_json FROM products WHERE product_name LIKE ? LIMIT 1",
-            (f"%{product_name}%",),
+            "SELECT data_json FROM products WHERE LOWER(REPLACE(product_name,'®','')) LIKE LOWER(?) LIMIT 1",
+            (f"%{q}%",),
         ).fetchone()
         conn.close()
         if row:
