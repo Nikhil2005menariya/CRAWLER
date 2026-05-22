@@ -1,84 +1,87 @@
 """
 graph/neo4j_client.py
 ──────────────────────
-Singleton-style Neo4j client. Loads credentials from .env, applies the
-graph schema on first connection, and provides a graceful offline fallback
-so that vector-only retrieval still works when Neo4j is not running.
+Singleton Neo4j client using the raw neo4j driver (no APOC dependency).
+Wraps the driver in a thin graph-like object that exposes a .query() method
+compatible with the rest of the codebase.
+
+Provides graceful offline fallback so vector-only retrieval still works
+when Neo4j is not running.
 """
 
 import logging
-import os
 from pathlib import Path
 from typing import Optional
 
-from dotenv import load_dotenv
-
 logger = logging.getLogger(__name__)
 
-# Load .env (backend/.env or repo root)
-for _candidate in [
-    Path(__file__).parents[2] / ".env",   # backend/.env
-    Path(__file__).parents[3] / ".env",   # repo root .env
-]:
-    if _candidate.exists():
-        load_dotenv(_candidate, override=False)
-        break
-
-_graph_instance = None  # module-level singleton
+_client_instance = None  # module-level singleton
 
 
-def get_graph(force_reconnect: bool = False):
+class _Neo4jClient:
     """
-    Return a connected langchain_neo4j.Neo4jGraph instance, or None if
-    Neo4j is not reachable (graceful fallback for vector-only mode).
+    Thin wrapper around the raw neo4j.GraphDatabase driver that exposes
+    a .query(cypher, params) method — same interface used throughout the
+    codebase — without requiring the APOC plugin.
+    """
+
+    def __init__(self, uri: str, user: str, password: str):
+        from neo4j import GraphDatabase
+        self._driver = GraphDatabase.driver(uri, auth=(user, password))
+        # Verify connectivity
+        with self._driver.session() as session:
+            session.run("RETURN 1").single()
+
+    def query(self, cypher: str, params: Optional[dict] = None) -> list:
+        """Execute a Cypher statement and return results as a list of dicts."""
+        params = params or {}
+        with self._driver.session() as session:
+            result = session.run(cypher, params)
+            return [dict(record) for record in result]
+
+    def close(self):
+        self._driver.close()
+
+
+def get_graph(force_reconnect: bool = False) -> Optional[_Neo4jClient]:
+    """
+    Return a connected _Neo4jClient, or None if Neo4j is not reachable.
 
     Args:
-        force_reconnect: If True, discard cached instance and reconnect.
+        force_reconnect: Discard cached instance and reconnect.
 
     Returns:
-        Neo4jGraph instance or None.
+        _Neo4jClient or None.
     """
-    global _graph_instance
-    if _graph_instance is not None and not force_reconnect:
-        return _graph_instance
+    global _client_instance
+    if _client_instance is not None and not force_reconnect:
+        return _client_instance
 
-    uri  = os.environ.get("NEO4J_URI")
-    user = os.environ.get("NEO4J_USER")
-    pwd  = os.environ.get("NEO4J_PASSWORD")
-
-    # Fallback to pydantic-settings (handles .env loading reliably)
-    if not all([uri, user, pwd]):
-        try:
-            from ..config.settings import Settings
-            s = Settings()
-            uri  = uri  or s.neo4j_uri
-            user = user or s.neo4j_user
-            pwd  = pwd  or s.neo4j_password
-        except Exception:
-            pass
-
-    uri  = uri  or "bolt://localhost:7687"
-    user = user or "neo4j"
-    pwd  = pwd  or ""
+    # Read credentials from Settings (absolute .env path, always works)
+    try:
+        from ..config.settings import Settings
+        s = Settings()
+        uri  = s.neo4j_uri
+        user = s.neo4j_user
+        pwd  = s.neo4j_password
+    except Exception:
+        uri, user, pwd = "bolt://localhost:7687", "neo4j", ""
 
     try:
-        from langchain_neo4j import Neo4jGraph
-        graph = Neo4jGraph(url=uri, username=user, password=pwd)
-        # Quick connectivity ping
-        graph.query("RETURN 1 AS ok")
-        _graph_instance = graph
+        client = _Neo4jClient(uri, user, pwd)
+        _client_instance = client
         logger.info("Neo4j connected: %s", uri)
-        # Apply schema on first successful connection
+        # Apply schema constraints/indexes
         from .schema import apply_schema
-        apply_schema(graph)
-        return graph
+        apply_schema(client)
+        return client
 
     except Exception as exc:
         logger.warning(
             "Neo4j unavailable (%s). Graph tools will return empty results; "
             "vector search will still work.", exc
         )
-        _graph_instance = None
+        _client_instance = None
         return None
 
 
@@ -87,7 +90,7 @@ def ping() -> bool:
     return get_graph() is not None
 
 
-def require_graph():
+def require_graph() -> _Neo4jClient:
     """Return graph or raise RuntimeError with a clear message."""
     g = get_graph()
     if g is None:
