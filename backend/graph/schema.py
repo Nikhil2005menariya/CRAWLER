@@ -33,7 +33,6 @@ REL_USES_TILE         = "USES_TILE"
 # ---------------------------------------------------------------------------
 SCHEMA_STATEMENTS = [
     # Uniqueness constraints (also create backing indexes)
-    "CREATE CONSTRAINT product_sku IF NOT EXISTS FOR (p:Product) REQUIRE p.sku IS UNIQUE",
     "CREATE CONSTRAINT product_name IF NOT EXISTS FOR (p:Product) REQUIRE p.name IS UNIQUE",
     "CREATE CONSTRAINT family_name IF NOT EXISTS FOR (f:ProductFamily) REQUIRE f.name IS UNIQUE",
     "CREATE CONSTRAINT usecase_name IF NOT EXISTS FOR (u:UseCase) REQUIRE u.name IS UNIQUE",
@@ -42,6 +41,7 @@ SCHEMA_STATEMENTS = [
     "CREATE CONSTRAINT standard_code IF NOT EXISTS FOR (s:Standard) REQUIRE s.code IS UNIQUE",
     "CREATE CONSTRAINT document_url IF NOT EXISTS FOR (d:Document) REQUIRE d.url IS UNIQUE",
     # Extra lookup indexes
+    "CREATE INDEX product_sku_idx IF NOT EXISTS FOR (p:Product) ON (p.sku)",
     "CREATE INDEX product_family_idx IF NOT EXISTS FOR (p:Product) ON (p.family)",
     "CREATE INDEX product_confidence_idx IF NOT EXISTS FOR (p:Product) ON (p.confidence)",
 ]

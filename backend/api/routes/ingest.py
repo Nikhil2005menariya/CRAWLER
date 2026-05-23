@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 _tasks: dict = {}
 
 
-async def _run_ingestion(task_id: str, request: IngestRequest):
+def _run_ingestion(task_id: str, request: IngestRequest):
     """Background ingestion task."""
     _tasks[task_id] = {"status": "running", "started_at": time.time()}
     try:
@@ -29,7 +29,7 @@ async def _run_ingestion(task_id: str, request: IngestRequest):
         from ...config.seed_urls import SEED_URLS
 
         s = Settings()
-        urls = request.urls or SEED_URLS[:10]
+        urls = request.urls or SEED_URLS
 
         state = {
             "urls_to_crawl":     urls,
@@ -46,7 +46,7 @@ async def _run_ingestion(task_id: str, request: IngestRequest):
             from ...agents.nodes.crawl_node import crawl_node
             state = crawl_node(state)
 
-        if not request.skip_parse and state.get("crawl_records"):
+        if not request.skip_parse:
             from ...agents.nodes.parse_node import parse_node
             state = parse_node(state)
 
@@ -67,7 +67,7 @@ async def _run_ingestion(task_id: str, request: IngestRequest):
 
 
 @router.post("/api/ingest", response_model=IngestResponse, tags=["Ingestion"])
-async def trigger_ingest(request: IngestRequest, background_tasks: BackgroundTasks):
+async def trigger_ingest(request: IngestRequest = IngestRequest(), background_tasks: BackgroundTasks = None):
     """
     Trigger the full ingestion pipeline (crawl → parse → embed) as a background task.
     Returns immediately with a task_id; poll /api/status for progress.

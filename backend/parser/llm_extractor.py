@@ -68,8 +68,8 @@ Rules:
 """
 
 
-def _build_llm() -> ChatGoogleGenerativeAI:
-    """Instantiate Gemini 2.5 Flash (reads GEMINI_API_KEY from env / .env file)."""
+def _build_llm():
+    """Instantiate LLM (Gemini 2.5 Flash, Groq, or OpenRouter fallback)."""
     import os
     from pathlib import Path
     from dotenv import load_dotenv
@@ -84,16 +84,40 @@ def _build_llm() -> ChatGoogleGenerativeAI:
             load_dotenv(candidate, override=False)
             break
 
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise EnvironmentError(
-            "GEMINI_API_KEY not found. Set it in backend/.env or your environment."
+    # 1. Groq Free Tier — fastest, try first
+    groq_key = os.environ.get("GROQ_API_KEY")
+    if groq_key:
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(
+            openai_api_base="https://api.groq.com/openai/v1",
+            openai_api_key=groq_key,
+            model_name="llama-3.3-70b-versatile",
+            temperature=0.0
         )
 
-    return ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
-        temperature=0,
-        google_api_key=api_key,
+    # 2. Gemini 2.5 Flash — 1M tokens/day free, high quality JSON extraction
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if api_key:
+        return ChatGoogleGenerativeAI(
+            model="gemini-2.5-flash",
+            temperature=0,
+            google_api_key=api_key,
+            max_retries=1,
+        )
+
+    # 3. OpenRouter Free Tier — last resort
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY")
+    if openrouter_key:
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(
+            openai_api_base="https://openrouter.ai/api/v1",
+            openai_api_key=openrouter_key,
+            model_name="meta-llama/llama-3-8b-instruct:free",
+            temperature=0.0
+        )
+
+    raise EnvironmentError(
+        "No LLM API key found. Set GROQ_API_KEY, GEMINI_API_KEY, or OPENROUTER_API_KEY in backend/.env."
     )
 
 
@@ -117,7 +141,7 @@ def _truncate(text: str, max_chars: int = 8000) -> str:
 
 def extract_product_from_record(
     record: CrawlRecord,
-    llm: Optional[ChatGoogleGenerativeAI] = None,
+    llm = None,
 ) -> Optional[dict]:
     """
     Extract a structured product dict from a CrawlRecord using Gemini.
@@ -147,26 +171,93 @@ def extract_product_from_record(
 
     content = _truncate(content)
     prompt = EXTRACTION_PROMPT.format(content=content)
-
+    data = None
     try:
         response = llm.invoke(prompt)
         raw = _strip_json_fences(response.content)
         data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        logger.warning("JSON parse error for %s: %s", record.url, exc)
-        # Try to salvage partial JSON
-        try:
-            # Find first { ... } block
-            match = re.search(r"\{.*\}", raw, re.DOTALL)
-            if match:
-                data = json.loads(match.group())
-            else:
-                return None
-        except Exception:
-            return None
     except Exception as exc:
-        logger.error("Gemini call failed for %s: %s", record.url, exc)
-        return None
+        exc_str = str(exc)
+        if "429" in exc_str or "rate_limit" in exc_str or "quota" in exc_str:
+            import os
+            groq_key = os.environ.get("GROQ_API_KEY")
+            if groq_key:
+                logger.warning("Groq TPD limit reached for %s. Attempting silent fallback to llama-3.1-8b-instant...", record.url)
+                try:
+                    from langchain_openai import ChatOpenAI
+                    import time
+                    fallback_llm = ChatOpenAI(
+                        openai_api_base="https://api.groq.com/openai/v1",
+                        openai_api_key=groq_key,
+                        model_name="llama-3.1-8b-instant",
+                        temperature=0.0,
+                        max_retries=5
+                    )
+                    # Try up to 3 times to handle 429 TPM limit
+                    for attempt in range(3):
+                        try:
+                            response = fallback_llm.invoke(prompt)
+                            raw = _strip_json_fences(response.content)
+                            data = json.loads(raw)
+                            break
+                        except Exception as inner_exc:
+                            inner_str = str(inner_exc)
+                            if "429" in inner_str or "rate_limit" in inner_str:
+                                logger.warning("Fallback LLM (Llama 8B) rate limited. Sleeping 15s before retry (attempt %d/3)...", attempt + 1)
+                                if attempt == 2:
+                                    raise inner_exc
+                                time.sleep(15)
+                            else:
+                                raise inner_exc
+                except Exception as fallback_exc:
+                    logger.warning("Fallback Llama 8B also failed for %s: %s — trying Gemini 2.5 Flash...", record.url, fallback_exc)
+                    # Final fallback: Gemini (try 2.5-flash first, then 1.5-flash)
+                    gemini_key = os.environ.get("GEMINI_API_KEY")
+                    if gemini_key:
+                        try:
+                            gemini_llm = ChatGoogleGenerativeAI(
+                                model="gemini-2.5-flash",
+                                temperature=0,
+                                google_api_key=gemini_key,
+                                max_retries=0,
+                            )
+                            response = gemini_llm.invoke(prompt)
+                            raw = _strip_json_fences(response.content)
+                            data = json.loads(raw)
+                            logger.info("Gemini 2.5 Flash fallback succeeded for %s", record.url)
+                        except Exception as gemini_exc:
+                            logger.warning("Gemini 2.5 Flash failed: %s — trying Gemini Flash fallback...", gemini_exc)
+                            try:
+                                gemini_llm = ChatGoogleGenerativeAI(
+                                    model="gemini-flash-latest",
+                                    temperature=0,
+                                    google_api_key=gemini_key,
+                                    max_retries=1,
+                                )
+                                response = gemini_llm.invoke(prompt)
+                                raw = _strip_json_fences(response.content)
+                                data = json.loads(raw)
+                                logger.info("Gemini Flash fallback succeeded for %s", record.url)
+                            except Exception as gemini_flash_exc:
+                                logger.error("Gemini Flash fallback also failed for %s: %s", record.url, gemini_flash_exc)
+                                return None
+                    else:
+                        logger.error("All LLM fallbacks exhausted for %s", record.url)
+                        return None
+            else:
+                logger.error("LLM call failed for %s: %s", record.url, exc)
+                return None
+        else:
+            # Handle JSON parse errors or try partial salvage
+            try:
+                match = re.search(r"\{.*\}", raw, re.DOTALL)
+                if match:
+                    data = json.loads(match.group())
+                else:
+                    return None
+            except Exception:
+                logger.error("LLM call failed for %s: %s", record.url, exc)
+                return None
 
     # Guard: product_name is required
     if not data.get("product_name"):
@@ -185,19 +276,34 @@ def extract_product_from_record(
 
 def extract_batch(
     records: list,
-    delay_seconds: float = GEMINI_INTER_CALL_DELAY,
+    delay_seconds: Optional[float] = None,
 ) -> list[dict]:
     """
     Extract products from a batch of CrawlRecords, respecting rate limits.
 
     Args:
         records:       List of CrawlRecord objects.
-        delay_seconds: Sleep between Gemini calls (default 4s for 15 RPM limit).
+        delay_seconds: Sleep between LLM calls (auto-tuned if None).
 
     Returns:
         List of successfully extracted product dicts (failures silently dropped).
     """
     llm = _build_llm()
+
+    # Self-tuning rate limit delay based on the active provider
+    if delay_seconds is None:
+        import os
+        if os.environ.get("GROQ_API_KEY"):
+            # Groq free tier allows 30 RPM -> 4.2s delay helps avoid TPM (token rate limits)!
+            delay_seconds = 4.2
+            logger.info("Auto-tuning LLM rate limit delay to %.1fs for Groq provider", delay_seconds)
+        elif os.environ.get("OPENROUTER_API_KEY"):
+            delay_seconds = 1.0
+            logger.info("Auto-tuning LLM rate limit delay to %.1fs for OpenRouter provider", delay_seconds)
+        else:
+            delay_seconds = GEMINI_INTER_CALL_DELAY
+            logger.info("Auto-tuning LLM rate limit delay to %.1fs for Gemini provider", delay_seconds)
+
     results = []
 
     for i, record in enumerate(records):

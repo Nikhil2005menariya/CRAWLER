@@ -70,7 +70,7 @@ class ProductVectorStore:
         document = (
             f"{product.get('product_name','')} "
             f"({product.get('product_family','')}) — "
-            f"{product.get('description','')[:200]}"
+            f"{(product.get('description') or '')[:200]}"
         )
         self._collection.upsert(
             ids=[doc_id],
@@ -81,22 +81,37 @@ class ProductVectorStore:
 
     def upsert_batch(self, products: list, embeddings: List[List[float]]) -> int:
         """Batch upsert products and their embeddings. Returns count upserted."""
-        ids, docs, metas = [], [], []
+        seen_ids = {}
         for p, emb in zip(products, embeddings):
-            ids.append(self._doc_id(p))
-            docs.append(
+            doc_id = self._doc_id(p)
+            doc_text = (
                 f"{p.get('product_name','')} ({p.get('product_family','')}) — "
-                f"{p.get('description','')[:200]}"
+                f"{(p.get('description') or '')[:200]}"
             )
-            metas.append({
+            metadata = {
                 "product_name":   p.get("product_name", ""),
                 "product_family": p.get("product_family", ""),
                 "sku":            p.get("sku") or "",
                 "confidence":     float(p.get("extraction_confidence", 0.0)),
                 "needs_review":   str(p.get("needs_human_review", False)),
-            })
-        self._collection.upsert(ids=ids, embeddings=embeddings, documents=docs, metadatas=metas)
-        return len(ids)
+            }
+            seen_ids[doc_id] = (emb, doc_text, metadata)
+
+        if not seen_ids:
+            return 0
+
+        final_ids = list(seen_ids.keys())
+        final_embeddings = [val[0] for val in seen_ids.values()]
+        final_docs = [val[1] for val in seen_ids.values()]
+        final_metas = [val[2] for val in seen_ids.values()]
+
+        self._collection.upsert(
+            ids=final_ids,
+            embeddings=final_embeddings,
+            documents=final_docs,
+            metadatas=final_metas
+        )
+        return len(final_ids)
 
     def similarity_search(
         self,
@@ -145,9 +160,6 @@ class ProductVectorStore:
 
     @staticmethod
     def _doc_id(product: dict) -> str:
-        """Stable ID: SKU if present, else normalised product name."""
-        sku = (product.get("sku") or "").strip()
-        if sku:
-            return f"sku:{sku}"
+        """Stable ID: normalised product name."""
         name = (product.get("product_name") or "unknown").strip().lower().replace(" ", "_")
         return f"name:{name}"

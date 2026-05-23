@@ -260,6 +260,31 @@ def cypher_query_tool(cypher: str) -> str:
     e.g. 'find all products compatible with concrete AND vitrified tiles
     that comply with C2TE standards'.
 
+    NEO4J SCHEMA CHEAT SHEET:
+    Nodes:
+    - (p:Product) properties:
+      - name: string (e.g. 'LATICRETE 345 Super Flex')
+      - family: string (e.g. 'tile_adhesive')
+      - grade: string (e.g. 'C2TE S1')
+      - description: string (e.g. 'A high-strength adhesive...')
+      - specs_json: string (JSON string of technical specs)
+      - confidence: float (0.0 to 1.0)
+      - needs_review: boolean (0 or 1)
+    - (f:ProductFamily) properties: name
+    - (u:UseCase) properties: name
+    - (s:Substrate) properties: name
+    - (t:TileType) properties: name
+    - (std:Standard) properties: code
+    - (d:Document) properties: url
+
+    Relationships:
+    - (:Product)-[:BELONGS_TO]->(:ProductFamily)
+    - (:Product)-[:RECOMMENDED_FOR]->(:UseCase)
+    - (:Product)-[:COMPATIBLE_WITH]->(:Substrate)
+    - (:Product)-[:SUITABLE_FOR]->(:TileType)
+    - (:Product)-[:COMPLIES_WITH]->(:Standard)
+    - (:Product)-[:DOCUMENTED_IN]->(:Document)
+
     Args:
         cypher: A valid read-only Cypher query string.
 

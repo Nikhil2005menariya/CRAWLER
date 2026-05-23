@@ -80,8 +80,7 @@ def _init_tables(conn: sqlite3.Connection) -> None:
 
 
 def _version_key(product: dict) -> str:
-    sku = (product.get("sku") or "").strip()
-    return sku if sku else (product.get("product_name") or "unknown").strip().lower()
+    return (product.get("product_name") or "unknown").strip().lower()
 
 
 def _diff_summary(old: dict, new: dict) -> str:
@@ -136,8 +135,8 @@ def _upsert_product(conn: sqlite3.Connection, product: dict) -> None:
     data_json = json.dumps(product, default=str)
 
     existing = conn.execute(
-        "SELECT id FROM products WHERE (sku = ? AND sku IS NOT NULL) OR product_name = ? LIMIT 1",
-        (sku, name),
+        "SELECT id FROM products WHERE product_name = ? LIMIT 1",
+        (name,),
     ).fetchone()
 
     if existing:
@@ -234,6 +233,48 @@ def parse_node(state: IngestionState) -> IngestionState:
     db_path = settings.sqlite_db_path
 
     crawl_records = state.get("crawl_records") or []
+    
+    # If state.get("crawl_records") is empty, load any existing crawl records from SQLite
+    # that haven't been parsed into the products table yet! This ensures missing
+    # products (e.g. from an expanded seed list on a subsequent crawl run) are successfully parsed.
+    if not crawl_records:
+        logger.info("parse_node: state.crawl_records is empty. Querying SQLite for unparsed crawl records...")
+        try:
+            with _get_connection(db_path) as conn:
+                # 1. Fetch already parsed URLs
+                parsed_urls = set()
+                try:
+                    p_rows = conn.execute("SELECT data_json FROM products").fetchall()
+                    for pr in p_rows:
+                        data = json.loads(pr["data_json"])
+                        for s_url in data.get("source_urls") or []:
+                            parsed_urls.add(s_url)
+                except Exception:
+                    pass
+                
+                # 2. Fetch all crawl records and filter out already parsed URLs
+                rows = conn.execute("SELECT url, fetched_at, status_code, content_type, content_hash, title, text, discovered_urls, etag, last_modified FROM crawl_records").fetchall()
+                from ...crawler.models import CrawlRecord
+                for r in rows:
+                    if r["url"] not in parsed_urls:
+                        crawl_records.append(
+                            CrawlRecord(
+                                url=r["url"],
+                                fetched_at=r["fetched_at"],
+                                status_code=r["status_code"],
+                                content_type=r["content_type"],
+                                content_hash=r["content_hash"],
+                                title=r["title"],
+                                text=r["text"],
+                                discovered_urls=r["discovered_urls"].split(",") if r["discovered_urls"] else [],
+                                etag=r["etag"],
+                                last_modified=r["last_modified"]
+                            )
+                        )
+            logger.info("parse_node: Resolved %d unparsed crawl records from SQLite database history.", len(crawl_records))
+        except Exception as exc:
+            logger.error("parse_node: Failed resolving unparsed historical crawl records: %s", exc)
+
     existing_errors = list(state.get("errors") or [])
     existing_metrics = dict(state.get("metrics") or {})
 

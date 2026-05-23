@@ -17,10 +17,10 @@ _CHECKS: list[tuple[str, Any]] = [
     ("product_family",     lambda d: bool(d.get("product_family"))),
     ("description",        lambda d: bool(d.get("description"))),
     ("coverage_rate",      lambda d: bool(
-        d.get("technical_specs", {}).get("coverage_rate")
+        (d.get("technical_specs") or {}).get("coverage_rate")
     )),
     ("open_time",          lambda d: bool(
-        d.get("technical_specs", {}).get("open_time")
+        (d.get("technical_specs") or {}).get("open_time")
     )),
     ("grade_classification", lambda d: bool(d.get("grade_classification"))),
     ("substrate_compatibility", lambda d: len(
@@ -53,6 +53,8 @@ def compute_confidence(product: dict) -> float:
     Returns:
         Float confidence score where 1.0 = all 12 fields populated.
     """
+    if not product or not isinstance(product, dict):
+        return 0.0
     passed = sum(1 for _, check in _CHECKS if check(product))
     return round(passed / _TOTAL, 4)
 
@@ -63,4 +65,6 @@ def field_report(product: dict) -> dict[str, bool]:
 
     Useful for QA reporting.
     """
-    return {label: bool(check(product)) for label, check in _CHECKS}
+    if not product or not isinstance(product, dict):
+        return {label: False for label, _ in _CHECKS}
+    return {label: check(product) for label, check in _CHECKS}

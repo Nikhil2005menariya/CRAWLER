@@ -43,6 +43,7 @@ SEED_URLS = [
     "https://myklaticrete.com/products/epoxy-tile-grout/cementitious/myk-laticrete-500/",
     "https://myklaticrete.com/products/epoxy-tile-grout/cementitious/myk-laticrete-600/",
     "https://myklaticrete.com/products/epoxy-tile-grout/specialty-grout/latapoxy-2000/",
+    "https://myklaticrete.com/products/epoxy-tile-grout/specialty-grout/latapoxy-dazzle/",
     "https://myklaticrete.com/products/waterproofing/laticrete-9237/",
     "https://myklaticrete.com/products/waterproofing/myk-laticrete-hydro-ban/",
     # Downloads (TDS/MSDS)

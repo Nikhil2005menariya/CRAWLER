@@ -21,6 +21,10 @@ from starlette.responses import Response
 from .routes import ingest as ingest_router
 from .routes import query as query_router
 from .routes import webhook as webhook_router
+from .routes import auth as auth_router
+from .routes import chat as chat_router
+from .routes import admin as admin_router
+from ..db.mongodb import connect_to_mongo, close_mongo_connection
 
 logger = logging.getLogger(__name__)
 
@@ -28,12 +32,14 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Start scheduler on startup, stop on shutdown."""
+    await connect_to_mongo()
     from ..sync.scheduler import get_scheduler
     scheduler = get_scheduler()
     scheduler.start()
     logger.info("FastAPI started — SyncScheduler running")
     yield
     scheduler.stop()
+    await close_mongo_connection()
     logger.info("FastAPI shutdown — SyncScheduler stopped")
 
 
@@ -63,6 +69,10 @@ def create_app() -> FastAPI:
     app.include_router(webhook_router.router)
     app.include_router(query_router.router)
     app.include_router(ingest_router.router)
+    
+    app.include_router(auth_router.router, prefix="/api/auth", tags=["Auth"])
+    app.include_router(chat_router.router, prefix="/api/chat", tags=["Chat"])
+    app.include_router(admin_router.router, prefix="/api/admin", tags=["Admin"])
 
     # Prometheus metrics endpoint
     @app.get("/metrics", include_in_schema=False)

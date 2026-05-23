@@ -65,6 +65,7 @@ class CrawlOrchestrator:
         return records
 
     def _crawl_url(self, url: str) -> Optional[CrawlRecord]:
+        self._logger.info("🕷️ Fetching: %s", url)
         headers = {"User-Agent": self.user_agent}
         with self.rate_limiter.limit():
             try:
@@ -75,12 +76,12 @@ class CrawlOrchestrator:
                     allow_redirects=True,
                 )
             except requests.RequestException as exc:
-                self._logger.warning("Request failed: %s (%s)", url, exc)
+                self._logger.warning("❌ Request failed: %s (%s)", url, exc)
                 return None
 
         content_type = detect_content_type(url, response.headers)
         if response.status_code >= 400:
-            self._logger.warning("Non-OK response: %s (status=%s)", url, response.status_code)
+            self._logger.warning("❌ Non-OK response: %s (status=%s)", url, response.status_code)
             return None
 
         if content_type == CONTENT_HTML:
@@ -92,7 +93,7 @@ class CrawlOrchestrator:
             text = extract_docx(response.content)
             discovered_urls, title = [], None
         else:
-            self._logger.info("Unsupported content type for %s", url)
+            self._logger.info("⚠️ Unsupported content type for %s", url)
             return None
 
         content_hash = compute_content_hash(text)
@@ -115,18 +116,35 @@ class CrawlOrchestrator:
         )
         self.storage.save_history(record, unchanged)
         if unchanged:
+            self._logger.info("  → Content unchanged (skipped): %s", url)
             return None
 
         self.storage.save_record(record)
+        self._logger.info("  ✅ Crawled successfully: %s (type=%s, hash=%s)", url, content_type, content_hash[:8])
         return record
+
+    # URL path prefixes that contain product or document content worth crawling
+    _PRODUCT_PATH_PREFIXES = (
+        "/products/",
+        "/downloads/",
+        "/solutions-by-applications/",
+        "/challenges-and-solutions/",
+        "/blog/",
+    )
 
     def _filter_discovered(self, urls: List[str], allowed_domains: Set[str]) -> List[str]:
         filtered: List[str] = []
         for link in urls:
             if not self._is_allowed_domain(link, allowed_domains):
                 continue
+            parsed = urlparse(link)
             content_type = detect_content_type(link, None)
-            if content_type in {CONTENT_PDF, CONTENT_DOCX}:
+            # For HTML pages: only follow links under known product/content paths
+            if content_type == CONTENT_HTML:
+                if any(parsed.path.startswith(prefix) for prefix in self._PRODUCT_PATH_PREFIXES):
+                    filtered.append(link)
+            # Always follow PDF/DOCX files (data sheets etc.)
+            elif content_type in {CONTENT_PDF, CONTENT_DOCX}:
                 filtered.append(link)
         return filtered
 

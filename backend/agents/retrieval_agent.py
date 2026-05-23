@@ -27,7 +27,7 @@ for _c in [Path(__file__).parents[1] / ".env", Path(__file__).parents[2] / ".env
         break
 
 
-def build_retrieval_agent():
+def build_retrieval_agent(force_model: str = None):
     """
     Build and return a compiled LangGraph ReAct agent.
 
@@ -45,20 +45,95 @@ def build_retrieval_agent():
     from ..tools.graph_tools import GRAPH_TOOLS
     from ..tools.vector_tools import VECTOR_TOOLS
 
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise EnvironmentError("GEMINI_API_KEY not set. Check backend/.env.")
-
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
-        temperature=0,
-        google_api_key=api_key,
-    )
+    # 1. Groq Free Tier
+    groq_key = os.environ.get("GROQ_API_KEY")
+    if groq_key:
+        from langchain_openai import ChatOpenAI
+        if force_model:
+            selected_model = force_model
+        else:
+            # Select best available model (handling 429 daily limits dynamically)
+            model_options = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+            selected_model = "llama-3.3-70b-versatile"
+            
+            for model_name in model_options:
+                try:
+                    # Test connectivity/quota
+                    test_llm = ChatOpenAI(
+                        openai_api_base="https://api.groq.com/openai/v1",
+                        openai_api_key=groq_key,
+                        model_name=model_name,
+                        max_retries=0
+                    )
+                    test_llm.invoke("ping")
+                    selected_model = model_name
+                    break
+                except Exception as exc:
+                    exc_str = str(exc)
+                    if "429" in exc_str or "rate_limit" in exc_str:
+                        logger.warning("Groq model %s rate limited/quota hit. Trying next model...", model_name)
+                        continue
+                    else:
+                        selected_model = model_name
+                        break
+        
+        logger.info("Retrieval Agent using Groq model: %s", selected_model)
+        llm = ChatOpenAI(
+            openai_api_base="https://api.groq.com/openai/v1",
+            openai_api_key=groq_key,
+            model_name=selected_model,
+            temperature=0.0
+        )
+    # 2. OpenRouter Free Tier
+    elif os.environ.get("OPENROUTER_API_KEY"):
+        from langchain_openai import ChatOpenAI
+        llm = ChatOpenAI(
+            openai_api_base="https://openrouter.ai/api/v1",
+            openai_api_key=os.environ.get("OPENROUTER_API_KEY"),
+            model_name="meta-llama/llama-3-8b-instruct:free",
+            temperature=0.0
+        )
+    # 3. Gemini Default
+    else:
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise EnvironmentError("GEMINI_API_KEY, GROQ_API_KEY, or OPENROUTER_API_KEY not set.")
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-2.5-flash",
+            temperature=0,
+            google_api_key=api_key,
+        )
 
     all_tools = GRAPH_TOOLS + VECTOR_TOOLS
 
     system_prompt = """You are a technical assistant specializing in MYK Laticrete construction chemicals.
 You help contractors, architects, and engineers select the right adhesive, grout, waterproofing, or surface treatment product.
+
+NEO4J GRAPH SCHEMA CHEAT SHEET:
+When generating raw cypher queries using cypher_query_tool, you MUST conform precisely to this schema structure:
+Nodes:
+- (p:Product) properties:
+  - name: string (e.g. 'LATICRETE 345 Super Flex')
+  - family: string (e.g. 'tile_adhesive')
+  - grade: string (e.g. 'C2TE S1')
+  - description: string (e.g. 'A high-strength adhesive...')
+  - specs_json: string (JSON string of technical specs)
+  - confidence: float (0.0 to 1.0)
+  - needs_review: boolean (0 or 1)
+- (f:ProductFamily) properties: name
+- (u:UseCase) properties: name
+- (s:Substrate) properties: name
+- (t:TileType) properties: name
+- (std:Standard) properties: code
+- (d:Document) properties: url
+
+Relationships:
+- (:Product)-[:BELONGS_TO]->(:ProductFamily)
+- (:Product)-[:RECOMMENDED_FOR]->(:UseCase)
+- (:Product)-[:COMPATIBLE_WITH]->(:Substrate)
+- (:Product)-[:SUITABLE_FOR]->(:TileType)
+- (:Product)-[:COMPLIES_WITH]->(:Standard)
+- (:Product)-[:DOCUMENTED_IN]->(:Document)
 
 You have access to these tools:
 - graph_search_tool: Search products by substrate, tile type, use case, or environment constraints
@@ -75,6 +150,11 @@ Strategy:
 4. For vague/semantic queries → use vector_search_tool
 5. Always provide specific product names, grades (C2TE, C1, etc.), and key specs in your answer
 6. If a product has needs_review=True or confidence < 0.6, mention it may need verification
+7. If graph_search_tool returns no matches or empty results, you MUST fall back and call vector_search_tool with the query terms before concluding that a product is not available in the database.
+
+CRITICAL TOOL CALL CONSTRAINTS:
+- You MUST only call EXACTLY ONE tool per turn. Never call multiple tools or try to batch tool calls in a single response turn.
+- Never output conversational text or punctuation inside your tool call JSON arguments. Keep argument values clean and direct (e.g. use "SP-100 DUO" instead of "the SP-100 DUO grout").
 
 Always be specific, technical, and cite the product name and grade classification in your answer."""
 
@@ -102,9 +182,38 @@ async def run_query(question: str, agent=None) -> dict:
     if agent is None:
         agent = build_retrieval_agent()
 
-    result = await agent.ainvoke({
-        "messages": [("user", question)]
-    })
+    try:
+        result = await agent.ainvoke({
+            "messages": [("user", question)]
+        })
+    except Exception as exc:
+        exc_str = str(exc)
+        if any(w in exc_str for w in ["429", "rate_limit", "400", "tool_use_failed", "BadRequestError", "Failed to call a function"]):
+            logger.warning("Active agent model rate limited or tool-use failed. Re-building agent using Llama 8B fallback...")
+            fallback_agent = build_retrieval_agent(force_model="llama-3.1-8b-instant")
+            try:
+                result = await fallback_agent.ainvoke({
+                    "messages": [("user", question)]
+                })
+            except Exception as inner_exc:
+                logger.error("Fallback agent also failed: %s. Proceeding with a simple text model without tools...", inner_exc)
+                from langchain_openai import ChatOpenAI
+                from langchain_core.messages import AIMessage, HumanMessage
+                direct_llm = ChatOpenAI(
+                    openai_api_base="https://api.groq.com/openai/v1",
+                    openai_api_key=os.environ.get("GROQ_API_KEY"),
+                    model_name="llama-3.1-8b-instant",
+                    temperature=0.0
+                )
+                direct_res = direct_llm.invoke([("user", question)])
+                return {
+                    "question":   question,
+                    "answer":     direct_res.content,
+                    "tools_used": ["direct_llm_fallback"],
+                    "messages":   [HumanMessage(content=question), AIMessage(content=direct_res.content)],
+                }
+        else:
+            raise exc
 
     messages = result.get("messages", [])
     final_answer = messages[-1].content if messages else "No answer generated."
